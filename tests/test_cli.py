@@ -113,6 +113,14 @@ class TestArgHandling:
         assert seen == [(None, True)]
         assert cli.cli_main(["policy", "--config"]) == cli.EXIT_REFUSED
 
+    def test_pause_dispatch_and_invalid_id(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(cli, "cmd_pause", lambda session_id: seen.append(session_id) or 0)
+        assert cli.cli_main(["pause", "7"]) == 0
+        assert seen == [7]
+        assert cli.cli_main(["pause"]) == cli.EXIT_REFUSED
+        assert cli.cli_main(["pause", "bad"]) == cli.EXIT_REFUSED
+
 
 class TestStatus:
     def test_empty_db(self, db, capsys):
@@ -149,6 +157,41 @@ class TestStatus:
         assert "paused" in out
         assert "1/2 cores done" in out
 
+    def test_pause_disables_automatic_resume_but_preserves_manual_resume(self, db, capsys):
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+        assert cli.cmd_pause(sid, db=db) == cli.EXIT_COMPLETED
+        assert tp.get_session(db, sid).status == "paused"
+        assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
+        assert "paused" in capsys.readouterr().out
+
+    def test_pause_refuses_missing_or_finished_session(self, db):
+        assert cli.cmd_pause(999, db=db) == cli.EXIT_REFUSED
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+        tp.update_session_status(db, sid, "completed")
+        assert cli.cmd_pause(sid, db=db) == cli.EXIT_REFUSED
+
+    def test_pause_owns_and_closes_default_database(self, monkeypatch):
+        from types import SimpleNamespace
+
+        class Database:
+            closed = False
+            status = "running"
+
+            def get_tuner_session(self, _session_id):
+                return SimpleNamespace(status=self.status)
+
+            def update_tuner_session_status(self, _session_id, status):
+                self.status = status
+
+            def close(self):
+                self.closed = True
+
+        database = Database()
+        monkeypatch.setattr("corecycler.history.db.HistoryDB", lambda: database)
+        assert cli.cmd_pause(4) == cli.EXIT_COMPLETED
+        assert database.status == "paused"
+        assert database.closed is True
+
     def test_lists_policy_groups_and_invalid_policy(self, db, capsys):
         from corecycler.tuner.policy import resolve_policy
 
@@ -179,6 +222,7 @@ class TestTopologyOutput:
         topo.x3d_detection = "ambiguous"
         topo.ccd_l3_sizes_kib = {0: 98304}
         lines = cli.topology_lines(topo)
+        assert "V-Cache CCD's found: 1" in lines
         assert any("96 MiB" in line for line in lines)
         assert any("L3 unavailable" in line for line in lines)
         assert any("WARNING" in line for line in lines)
@@ -202,6 +246,7 @@ class TestPolicyOutput:
         cfg = TunerConfig(cores_to_test=[0, 8], x3d_mode="force", x3d_force_vcache_ccds=[1])
         snap = resolve_policy(cfg, self._x3d_topology(), (-60, 10))
         lines = cli.policy_lines(snap, cfg)
+        assert "V-Cache CCD's found: 1" in lines
         assert any(line.startswith("WARNING:") for line in lines)
         assert any(line.startswith("V-Cache:") for line in lines)
         assert any(line.startswith("Standard/Frequency:") for line in lines)
@@ -437,12 +482,47 @@ class TestRunStatusAndSignal:
         def factory(_db, _config):
             eng = FakeEngine("runs")
             made.append(eng)
-            QTimer.singleShot(10, lambda: captured[signal_mod.SIGINT](signal_mod.SIGINT, None))
+
+            def interrupt_twice():
+                captured[signal_mod.SIGINT](signal_mod.SIGINT, None)
+                captured[signal_mod.SIGINT](signal_mod.SIGINT, None)
+
+            QTimer.singleShot(10, interrupt_twice)
             return eng
 
         code = cli.cmd_run(None, None, False, engine_factory=factory, db=db)
         assert code == cli.EXIT_SIGNAL
         assert made[0].status == "idle"
+
+    def test_real_sigint_wakes_quiet_qt_event_loop(self, db):
+        import os
+        import signal as signal_mod
+        import threading
+
+        old_int = signal_mod.getsignal(signal_mod.SIGINT)
+        old_term = signal_mod.getsignal(signal_mod.SIGTERM)
+        sent = threading.Event()
+
+        class SignalEngine(FakeEngine):
+            def start(self) -> None:
+                self.status = "running"
+
+                def interrupt() -> None:
+                    sent.set()
+                    os.kill(os.getpid(), signal_mod.SIGINT)
+
+                timer = threading.Timer(0.05, interrupt)
+                timer.daemon = True
+                timer.start()
+
+        try:
+            code = cli.cmd_run(None, None, False, engine_factory=lambda *_: SignalEngine("runs"), db=db)
+        finally:
+            signal_mod.signal(signal_mod.SIGINT, old_int)
+            signal_mod.signal(signal_mod.SIGTERM, old_term)
+
+        assert sent.is_set()
+        assert code == cli.EXIT_SIGNAL
 
     def test_auto_resume_falls_back_to_first_resumable(self, db):
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")

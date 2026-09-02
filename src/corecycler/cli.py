@@ -29,6 +29,7 @@ corecycler headless commands:
   corecycler topology             show CCD cache evidence and X3D classification
   corecycler policy [--config F]  preview the exact per-core tuning policy
   corecycler status               list tuner sessions and their state
+  corecycler pause SESSION_ID     disable automatic resume for an in-flight session
   corecycler tune [--config F] [--accept-x3d-positive]
                                    start a NEW tuning session and run to the end
   corecycler resume [SESSION_ID]  resume a mid-run/paused session (newest if omitted)
@@ -55,6 +56,16 @@ def cli_main(argv: list[str]) -> int:
         return cmd_policy(config_path, "--accept-x3d-positive" in argv[1:])
     if command == "status":
         return cmd_status()
+    if command == "pause":
+        if len(argv) != 2:
+            print("corecycler pause: exactly one SESSION_ID is required", file=sys.stderr)
+            return EXIT_REFUSED
+        try:
+            session_id = int(argv[1])
+        except ValueError:
+            print(f"corecycler pause: invalid session id {argv[1]!r}", file=sys.stderr)
+            return EXIT_REFUSED
+        return cmd_pause(session_id)
     if command == "tune":
         config_path = _flag_value(argv[1:], "--config")
         if config_path is _INVALID:
@@ -117,7 +128,7 @@ def topology_lines(topology) -> list[str]:
     lines = [
         topology.model_name or "Unknown CPU",
         f"X3D detection: {topology.x3d_detection}",
-        f"V-Cache CCDs: {','.join(map(str, sorted(topology.vcache_ccds))) or 'none'}",
+        f"V-Cache CCD's found: {len(topology.vcache_ccds)}",
     ]
     for ccd in sorted({info.ccd for info in topology.cores.values() if info.ccd is not None}):
         size = topology.ccd_l3_sizes_kib.get(ccd)
@@ -142,16 +153,14 @@ def policy_lines(snapshot, config) -> list[str]:
     lines = [
         f"X3D mode: {snapshot.x3d['mode']}",
         f"Detection: {snapshot.x3d['detection']} ({snapshot.x3d['mapping_source']})",
-        "Effective V-Cache CCDs: "
-        + (",".join(map(str, snapshot.x3d["effective_vcache_ccds"])) or "none"),
+        f"V-Cache CCD's found: {len(snapshot.x3d['effective_vcache_ccds'])}",
         "Positive X3D acknowledgement required: "
         + ("yes" if config.direction > 0 and snapshot.x3d["effective_vcache_ccds"] else "no"),
     ]
     lines.extend(f"WARNING: {warning}" for warning in snapshot.warnings)
     for core_class, heading in (("vcache", "V-Cache"), ("standard", "Standard/Frequency")):
         members = [
-            f"C{core}: limit {policy.max_offset}, step {policy.coarse_step}, "
-            f"confirm {policy.confirm_multiplier:g}x"
+            f"C{core}: limit {policy.max_offset}, step {policy.coarse_step}, confirm {policy.confirm_multiplier:g}x"
             for core, policy in sorted(snapshot.policies.items())
             if policy.core_class == core_class
         ]
@@ -245,6 +254,33 @@ def cmd_status(db=None) -> int:
             db.close()
 
 
+def cmd_pause(session_id: int, db=None) -> int:
+    """Persistently suppress automatic boot resume for an in-flight session."""
+    from corecycler.history.db import HistoryDB
+    from corecycler.tuner import persistence as tp
+
+    own_db = db is None
+    if db is None:
+        db = HistoryDB()
+    try:
+        session = tp.get_session(db, session_id)
+        if session is None:
+            print(f"corecycler pause: session #{session_id} does not exist", file=sys.stderr)
+            return EXIT_REFUSED
+        if session.status not in ("running", "validating", "paused"):
+            print(
+                f"corecycler pause: session #{session_id} is {session.status}, not in flight",
+                file=sys.stderr,
+            )
+            return EXIT_REFUSED
+        tp.update_session_status(db, session_id, "paused")
+        print(f"corecycler: session #{session_id} paused; automatic boot resume disabled")
+        return EXIT_COMPLETED
+    finally:
+        if own_db:
+            db.close()
+
+
 def _build_smu(topology):
     from corecycler.smu.commands import detect_generation, get_commands
     from corecycler.smu.driver import RyzenSMU, core_map_blocked
@@ -270,7 +306,7 @@ def cmd_run(
     engine_factory=None,
     db=None,
 ) -> int:
-    from PySide6.QtCore import QCoreApplication, QLockFile
+    from PySide6.QtCore import QCoreApplication, QLockFile, QTimer
 
     from corecycler.config.paths import user_home
 
@@ -369,7 +405,13 @@ def cmd_run(
 
     engine.status_changed.connect(on_status)
 
+    signal_requested = False
+
     def on_signal(signum, _frame) -> None:
+        nonlocal signal_requested
+        if signal_requested:
+            return
+        signal_requested = True
         print(f"corecycler: signal {signum} — aborting (offsets revert)", flush=True)
         outcome["exit"] = EXIT_SIGNAL
         engine.abort()
@@ -377,6 +419,16 @@ def cmd_run(
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+
+    # CPython only dispatches its Python-level signal handlers while the main
+    # thread executes Python bytecode.  A quiet QCoreApplication.exec() can sit
+    # inside Qt's C++ event loop indefinitely, leaving terminal Ctrl-C pending
+    # until some unrelated Qt/Python callback happens.  Keep a small timer alive
+    # for the duration of the headless run so SIGINT/SIGTERM is observed promptly.
+    signal_pump = QTimer()
+    signal_pump.setInterval(100)
+    signal_pump.timeout.connect(lambda: None)
+    signal_pump.start()
 
     if resume_id is not None:
         engine.resume(resume_id)
@@ -402,6 +454,7 @@ def cmd_run(
         return EXIT_REFUSED
 
     app.exec()
+    signal_pump.stop()
     code = outcome.get("exit", EXIT_ENGINE_ABORTED)
     _notify_outcome(code)
     return code
