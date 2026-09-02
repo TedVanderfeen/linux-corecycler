@@ -224,6 +224,16 @@ class TunerConfig:
                     not isinstance(max_value, int) or isinstance(max_value, bool) or not -60 <= max_value <= 60
                 ):
                     errors.append(f"core_policy_overrides[{core}].max_offset must be -60..60")
+                elif max_value is not None and self.direction == -1 and max_value > self.start_offset:
+                    errors.append(
+                        f"core_policy_overrides[{core}].max_offset must be <= start_offset "
+                        "for a negative search"
+                    )
+                elif max_value is not None and self.direction == 1 and max_value < self.start_offset:
+                    errors.append(
+                        f"core_policy_overrides[{core}].max_offset must be >= start_offset "
+                        "for a positive search"
+                    )
                 if step_value is not None and (
                     not isinstance(step_value, int) or isinstance(step_value, bool) or not 1 <= step_value <= 15
                 ):
@@ -240,6 +250,10 @@ class TunerConfig:
             errors.append(f"fine_step must be >= 1, got {self.fine_step}")
         if self.fine_step > self.coarse_step:
             errors.append(f"fine_step ({self.fine_step}) must be <= coarse_step ({self.coarse_step})")
+        if self.direction == -1 and self.max_offset > self.start_offset:
+            errors.append("max_offset must be <= start_offset for a negative search")
+        if self.direction == 1 and self.max_offset < self.start_offset:
+            errors.append("max_offset must be >= start_offset for a positive search")
         if self.cores_to_test is not None and len(self.cores_to_test) == 0:
             errors.append("cores_to_test is empty — no cores to test")
         if self.search_duration_seconds < 1:

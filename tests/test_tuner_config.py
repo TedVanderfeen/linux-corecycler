@@ -149,6 +149,8 @@ class TestX3DConfigValidation:
             ({"core_policy_overrides": {"0": {"max_offset": True}}}, "max_offset"),
             ({"core_policy_overrides": {"0": {"coarse_step": 0}}}, "coarse_step"),
             ({"core_policy_overrides": {"0": {"confirm_multiplier": False}}}, "confirm_multiplier"),
+            ({"core_policy_overrides": {"0": {"max_offset": 5}}}, "negative search"),
+            ({"direction": 1, "max_offset": 5, "core_policy_overrides": {"0": {"max_offset": -5}}}, "positive search"),
         ],
     )
     def test_invalid_x3d_fields(self, kwargs, message):
@@ -164,6 +166,16 @@ class TestX3DConfigValidation:
         restored = TunerConfig.from_json(cfg.to_json())
         assert restored.x3d_mode == "force"
         assert restored.core_policy_overrides == cfg.core_policy_overrides
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            TunerConfig(start_offset=0, max_offset=5, direction=-1),
+            TunerConfig(start_offset=0, max_offset=-5, direction=1),
+        ],
+    )
+    def test_search_limit_must_follow_direction(self, config):
+        assert any("max_offset" in error and "search" in error for error in config.validate())
 
     def test_validate_memory_default_and_roundtrips(self):
         cfg = TunerConfig()
