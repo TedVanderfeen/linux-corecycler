@@ -33,6 +33,7 @@ from corecycler.gui.style import duration_str, font_mono, phase_label, span_str,
 from corecycler.gui.widgets import table_item as _item
 from corecycler.history.timefmt import format_local
 from corecycler.tuner import persistence as tp
+from corecycler.tuner.policy import PolicySnapshot
 from corecycler.tuner.state import TunerPhase, TunerSession
 
 if TYPE_CHECKING:
@@ -911,6 +912,10 @@ class HistoryTab(QWidget):
             cfg = json.loads(sess.config_json)
         except (json.JSONDecodeError, TypeError):
             cfg = {}
+        try:
+            policy_snapshot = PolicySnapshot.from_json(getattr(sess, "policy_json", "{}"))
+        except ValueError:
+            policy_snapshot = None
 
         info_parts = [
             sess.cpu_model or "Unknown CPU",
@@ -951,7 +956,17 @@ class HistoryTab(QWidget):
         self._core_results_table.setColumnWidth(5, 80)
         self._core_results_table.setColumnWidth(6, 120)
 
-        sorted_cores = sorted(core_states.keys())
+        sorted_cores = sorted(
+            core_states,
+            key=lambda core: (
+                0
+                if policy_snapshot is not None
+                and policy_snapshot.policies.get(core)
+                and policy_snapshot.policies[core].core_class == "vcache"
+                else 1,
+                core,
+            ),
+        )
         self._core_results_table.setRowCount(len(sorted_cores))
 
         for row_idx, core_id in enumerate(sorted_cores):
@@ -1008,9 +1023,21 @@ class HistoryTab(QWidget):
         profile = tp.get_best_profile(self._db, sess.id)
         if profile:
             lines.append("")
-            lines.append("── Confirmed CO Profile ──")
-            for cid in sorted(profile):
-                lines.append(f"  Core {cid}: {profile[cid]}")
+            lines.append("── Confirmed CO Profile / BIOS Recommendations ──")
+            if policy_snapshot is None:
+                for cid in sorted(profile):
+                    lines.append(f"  Core {cid}: {profile[cid]}")
+            else:
+                for core_class, heading in (("vcache", "V-Cache"), ("standard", "Standard/Frequency")):
+                    members = [
+                        cid
+                        for cid in sorted(profile)
+                        if policy_snapshot.policies.get(cid)
+                        and policy_snapshot.policies[cid].core_class == core_class
+                    ]
+                    if members:
+                        lines.append(f"  {heading}:")
+                        lines.extend(f"    Core {cid}: {profile[cid]}" for cid in members)
 
         self._events_log.setPlainText("\n".join(lines))
 

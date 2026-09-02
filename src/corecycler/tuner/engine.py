@@ -36,6 +36,7 @@ from corecycler.smu.driver import core_map_blocked
 
 from . import persistence as tp
 from .config import TunerConfig
+from .policy import CorePolicy, PolicySnapshot, legacy_policy, resolve_policy
 from .state import CoreState, TunerPhase
 
 if TYPE_CHECKING:
@@ -440,6 +441,7 @@ class TunerEngine(QObject):
         backend: StressBackend,
         config: TunerConfig | None = None,
         work_dir: Path | None = None,
+        accept_x3d_positive: bool = False,
     ) -> None:
         super().__init__()
         self._db = db
@@ -448,6 +450,9 @@ class TunerEngine(QObject):
         self._backend = backend
         self._config = config or TunerConfig()
         self._work_dir = work_dir or resolve_work_dir() / "tuner"
+        self._accept_x3d_positive = accept_x3d_positive
+        self._policy_snapshot: PolicySnapshot | None = None
+        self._core_policies: dict[int, CorePolicy] = {}
 
         self._msr = MSRReader()
         self._boot_id = _read_boot_id()
@@ -505,6 +510,10 @@ class TunerEngine(QObject):
             self._config.clamp_max_offset(smu.commands.co_range)
 
     @property
+    def policy_snapshot(self) -> PolicySnapshot | None:
+        return self._policy_snapshot
+
+    @property
     def status(self) -> str:
         return self._status
 
@@ -541,6 +550,21 @@ class TunerEngine(QObject):
             self.log_message.emit(f"Invalid tuner config: {'; '.join(errors)}")
             return
 
+        co_range = self._smu.commands.co_range if self._smu is not None else (-60, 60)
+        try:
+            self._policy_snapshot = resolve_policy(
+                self._config,
+                self._topology,
+                co_range,
+                positive_acknowledged=self._accept_x3d_positive,
+            )
+        except ValueError as exc:
+            self.log_message.emit(f"Cannot start: {exc}")
+            return
+        self._core_policies = self._policy_snapshot.policies
+        for warning in self._policy_snapshot.warnings:
+            self.log_message.emit(f"X3D POLICY WARNING: {warning}")
+
         # A tuning session is meaningless when per-core CO addressing is
         # refused: every write would fail and every result would be noise.
         map_err = core_map_blocked(self._smu)
@@ -560,6 +584,7 @@ class TunerEngine(QObject):
             bios_version=ctx.bios_version,
             cpu_model=self._topology.model_name,
             context_id=context_id,
+            policy_json=self._policy_snapshot.to_json(),
         )
 
         # Initialize core states
@@ -577,6 +602,20 @@ class TunerEngine(QObject):
 
         for core_id in cores:
             start = current_offsets.get(core_id, self._config.start_offset)
+            policy = self._core_policies[core_id]
+            if self._config.direction < 0 and policy.core_class == "vcache" and start < policy.max_offset:
+                original = start
+                start = policy.max_offset
+                self.log_message.emit(
+                    f"Clamping inherited V-Cache baseline for core {core_id} from {original} to {start}."
+                )
+                if self._smu is None or not self._apply_co(core_id, start) or self._smu.get_co_offset(core_id) != start:
+                    tp.update_session_status(self._db, self._session_id, "aborted")
+                    self.log_message.emit(
+                        f"Cannot start: core {core_id} V-Cache baseline clamp could not be verified by SMU readback."
+                    )
+                    self._set_status("idle")
+                    return
             cs = CoreState(core_id=core_id, current_offset=start, baseline_offset=start)
             self._core_states[core_id] = cs
             tp.save_core_state(self._db, self._session_id, cs)
@@ -585,7 +624,7 @@ class TunerEngine(QObject):
         self._set_status("running")
         self.log_message.emit(
             f"Started tuner session {self._session_id} — "
-            f"{len(cores)} cores, coarse step {self._config.coarse_step}, "
+            f"{len(cores)} cores, resolved per-core policy, "
             f"fine step {self._config.fine_step}"
         )
         if any(v is not None for v in (ctx.ppt_limit_w, ctx.tdc_limit_a, ctx.edc_limit_a)):
@@ -641,6 +680,28 @@ class TunerEngine(QObject):
         if errors:
             self.log_message.emit(f"Invalid tuner config: {'; '.join(errors)}")
             return
+
+        try:
+            snapshot = PolicySnapshot.from_json(session.policy_json)
+        except ValueError as exc:
+            self.log_message.emit(f"Cannot resume: {exc}")
+            return
+        if snapshot is None:
+            # Never reinterpret a legacy session using today's X3D detector.
+            self._policy_snapshot = None
+            self._core_policies = legacy_policy(self._config, sorted(self._topology.cores))
+            self.log_message.emit("Legacy session: retaining uniform search policy.")
+        else:
+            topology_errors = snapshot.validate_topology(self._topology)
+            if topology_errors:
+                self.log_message.emit(f"Cannot resume: {'; '.join(topology_errors)}")
+                return
+            self._policy_snapshot = snapshot
+            self._core_policies = snapshot.policies
+            if not self._topology.ccd_l3_sizes_kib and snapshot.topology.get("ccd_l3_sizes_kib"):
+                self.log_message.emit(
+                    "X3D POLICY WARNING: cache evidence is temporarily unavailable; retaining snapshot."
+                )
 
         # start() refuses on an unusable per-core CO map; a resumed session
         # would otherwise grind through refused writes as apparatus faults.
@@ -953,6 +1014,21 @@ class TunerEngine(QObject):
             if errors:
                 self.log_message.emit(f"Invalid tuner config: {'; '.join(errors)}")
                 return
+            try:
+                snapshot = PolicySnapshot.from_json(session.policy_json)
+            except ValueError as exc:
+                self.log_message.emit(f"Cannot validate: {exc}")
+                return
+            if snapshot is None:
+                self._policy_snapshot = None
+                self._core_policies = legacy_policy(self._config, sorted(self._topology.cores))
+            else:
+                topology_errors = snapshot.validate_topology(self._topology)
+                if topology_errors:
+                    self.log_message.emit(f"Cannot validate: {'; '.join(topology_errors)}")
+                    return
+                self._policy_snapshot = snapshot
+                self._core_policies = snapshot.policies
 
         # Reset confirmed cores to "confirming" for re-validation
         self._core_states = tp.load_core_states(self._db, session_id)
@@ -1056,15 +1132,16 @@ class TunerEngine(QObject):
                 cs.phase = TunerPhase.COARSE_SEARCH
                 # Use inherited offset as base when inherit_current is active
                 base = cs.current_offset if (cfg.inherit_current and cs.current_offset != 0) else cfg.start_offset
-                cs.current_offset = base + direction * cfg.coarse_step
-                if self._exceeds_max(cs.current_offset):
-                    cs.current_offset = cfg.max_offset
+                policy = self._policy_for(core_id)
+                cs.current_offset = base + direction * policy.coarse_step
+                if self._exceeds_max(cs.current_offset, core_id):
+                    cs.current_offset = policy.max_offset
 
             case TunerPhase.COARSE_SEARCH:
                 if passed:
                     cs.best_offset = cs.current_offset
                     next_offset = cs.current_offset + direction * self._get_coarse_step(cs)
-                    if self._exceeds_max(next_offset):
+                    if self._exceeds_max(next_offset, core_id):
                         # Hit the limit — settle here
                         cs.phase = TunerPhase.SETTLED
                     else:
@@ -1074,7 +1151,7 @@ class TunerEngine(QObject):
                     cs.coarse_fail_offset = cs.current_offset
                     if cs.best_offset is None:
                         # Never passed — check abort threshold
-                        if cs.current_offset == cfg.start_offset + direction * cfg.coarse_step:
+                        if cs.current_offset == cfg.start_offset + direction * self._policy_for(core_id).coarse_step:
                             self._consecutive_start_failures += 1
                         cs.phase = TunerPhase.SETTLED  # nothing we can do
                     else:
@@ -1082,8 +1159,8 @@ class TunerEngine(QObject):
                         cs.phase = TunerPhase.FINE_SEARCH
                         cs.current_offset = cs.best_offset + direction * cfg.fine_step
                         # Never start the first fine test past the safety cap.
-                        if self._exceeds_max(cs.current_offset):
-                            cs.current_offset = cfg.max_offset
+                        if self._exceeds_max(cs.current_offset, core_id):
+                            cs.current_offset = self._policy_for(core_id).max_offset
                         # Don't re-test the known coarse-fail offset (guaranteed
                         # fail) — settle at the last good value instead.
                         if cs.coarse_fail_offset is not None and (
@@ -1103,7 +1180,7 @@ class TunerEngine(QObject):
                             (direction < 0 and next_offset <= cs.coarse_fail_offset)
                             or (direction > 0 and next_offset >= cs.coarse_fail_offset)
                         )
-                        or self._exceeds_max(next_offset)
+                        or self._exceeds_max(next_offset, core_id)
                     ):
                         cs.phase = TunerPhase.SETTLED
                     else:
@@ -1298,17 +1375,22 @@ class TunerEngine(QObject):
 
     def _get_coarse_step(self, cs: CoreState) -> int:
         """Get coarse step size, reducing near max_offset for safety."""
-        distance = abs(cs.current_offset - self._config.max_offset)
-        ramp_zone = self._config.coarse_step * 2
+        policy = self._policy_for(cs.core_id)
+        distance = abs(cs.current_offset - policy.max_offset)
+        ramp_zone = policy.coarse_step * 2
         if distance <= ramp_zone:
             return self._config.fine_step
-        return self._config.coarse_step
+        return policy.coarse_step
 
-    def _exceeds_max(self, offset: int) -> bool:
+    def _exceeds_max(self, offset: int, core_id: int | None = None) -> bool:
         """Check if offset exceeds max_offset in the configured direction."""
+        limit = self._policy_for(core_id).max_offset if core_id is not None else self._config.max_offset
         if self._config.direction < 0:
-            return offset < self._config.max_offset
-        return offset > self._config.max_offset
+            return offset < limit
+        return offset > limit
+
+    def _policy_for(self, core_id: int) -> CorePolicy:
+        return self._core_policies.get(core_id, CorePolicy(self._config.max_offset, self._config.coarse_step))
 
     def _at_or_past_baseline(self, offset: int, cs: CoreState) -> bool:
         """Check if offset is at or past the core's baseline in the configured direction."""
@@ -2320,7 +2402,10 @@ class TunerEngine(QObject):
             TunerPhase.HARDENING_T1,
             TunerPhase.HARDENING_T2,
         ):
-            duration = self._config.confirm_duration_seconds
+            duration = max(
+                1,
+                round(self._config.confirm_duration_seconds * self._policy_for(core_id).confirm_multiplier),
+            )
         elif cs.phase == TunerPhase.BACKOFF_PRECONFIRM:
             duration = int(self._config.search_duration_seconds * self._config.backoff_preconfirm_multiplier)
         elif self._status == "validating":

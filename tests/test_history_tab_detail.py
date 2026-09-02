@@ -622,6 +622,48 @@ class TestTunerSessionDetail:
         tab._show_tuner_session_detail(sess)
         assert "coarse=?" in tab._detail_info.text()
 
+    def test_policy_groups_order_and_bios_recommendations(self, db):
+        from corecycler.engine.topology import CPUTopology, PhysicalCore
+        from corecycler.tuner.policy import resolve_policy
+
+        topo = CPUTopology(
+            model_name="X3D",
+            family=26,
+            model=68,
+            vcache_ccds=frozenset({0}),
+            x3d_detection="cache_verified",
+            cores={
+                0: PhysicalCore(0, 0, None, (0,), True),
+                1: PhysicalCore(1, 1, None, (1,), False),
+            },
+        )
+        cfg = TunerConfig(cores_to_test=[0, 1])
+        policy = resolve_policy(cfg, topo, (-60, 10)).to_json()
+        sid = tp.create_session(db, cfg, "", topo.model_name, policy_json=policy)
+        for core, offset in ((0, -20), (1, -40)):
+            tp.save_core_state(
+                db,
+                sid,
+                CoreState(core_id=core, phase=TunerPhase.HARDENED, current_offset=offset, best_offset=offset),
+            )
+        tab = _tab(db)
+        tab._show_tuner_session_detail(db.get_tuner_session(sid))
+        assert tab._core_results_table.item(0, 0).text() == "0"
+        text = tab._events_log.toPlainText()
+        assert "V-Cache:" in text
+        assert "Standard/Frequency:" in text
+
+    def test_invalid_policy_falls_back_to_legacy_display(self, db):
+        sid = tp.create_session(db, TunerConfig(), "", "CPU", policy_json="{")
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(core_id=0, phase=TunerPhase.HARDENED, current_offset=-10, best_offset=-10),
+        )
+        tab = _tab(db)
+        tab._show_tuner_session_detail(db.get_tuner_session(sid))
+        assert "Core 0: -10" in tab._events_log.toPlainText()
+
     def test_rows_are_skipped_without_a_database(self, db):
         _seed_session(db)
         tab = _tab(db)

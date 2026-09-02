@@ -784,6 +784,143 @@ class TestExceedsMax:
         assert eng._exceeds_max(9) is False
 
 
+class TestX3DPolicyLifecycle:
+    @staticmethod
+    def _mark_vcache(topo, *, detection="cache_verified"):
+        topo.is_x3d = True
+        topo.vcache_ccds = frozenset({0})
+        topo.vcache_ccd = 0
+        topo.x3d_detection = detection
+        topo.ccd_l3_sizes_kib = {0: 98304}
+        for core in topo.cores.values():
+            object.__setattr__(core, "ccd", 0)
+            object.__setattr__(core, "has_vcache", True)
+        return topo
+
+    def test_property_and_positive_start_refusal(self, db, simple_topology, mock_smu, mock_backend):
+        topo = self._mark_vcache(simple_topology)
+        eng = TunerEngine(
+            db,
+            topo,
+            mock_smu,
+            mock_backend,
+            TunerConfig(direction=1, max_offset=5, cores_to_test=[0]),
+        )
+        messages = []
+        eng.log_message.connect(messages.append)
+        eng.start()
+        assert eng.policy_snapshot is None
+        assert any("acknowledgement" in message for message in messages)
+
+    def test_ambiguous_warning_is_journalled(self, db, simple_topology, mock_smu, mock_backend):
+        topo = self._mark_vcache(simple_topology, detection="ambiguous")
+        topo.vcache_ccds = frozenset()
+        eng = TunerEngine(db, topo, mock_smu, mock_backend, TunerConfig(cores_to_test=[0]))
+        messages = []
+        eng.log_message.connect(messages.append)
+        with patch.object(eng, "_run_next"):
+            eng.start()
+        assert any("X3D POLICY WARNING" in message for message in messages)
+
+    def test_inherited_vcache_baseline_is_clamped_and_read_back(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        topo = self._mark_vcache(simple_topology)
+        mock_smu.get_co_offset.side_effect = [-40, -25]
+        eng = TunerEngine(
+            db,
+            topo,
+            mock_smu,
+            mock_backend,
+            TunerConfig(cores_to_test=[0], inherit_current=True),
+        )
+        with patch.object(eng, "_run_next"):
+            eng.start()
+        assert eng.core_states[0].baseline_offset == -25
+        mock_smu.set_co_offset.assert_any_call(0, -25)
+
+    def test_unverified_baseline_clamp_aborts(self, db, simple_topology, mock_smu, mock_backend):
+        topo = self._mark_vcache(simple_topology)
+        mock_smu.get_co_offset.return_value = -40
+        mock_smu.set_co_offset.return_value = False
+        eng = TunerEngine(
+            db,
+            topo,
+            mock_smu,
+            mock_backend,
+            TunerConfig(cores_to_test=[0], inherit_current=True),
+        )
+        eng.start()
+        assert eng.status == "idle"
+        assert tp.get_session(db, eng.session_id).status == "aborted"
+
+    def _policy_session(self, db, topo, config=None, *, policy_json=None):
+        from corecycler.tuner.policy import resolve_policy
+
+        config = config or TunerConfig(cores_to_test=[0])
+        if policy_json is None:
+            policy_json = resolve_policy(config, topo, (-60, 10)).to_json()
+        sid = tp.create_session(db, config, "", topo.model_name, policy_json=policy_json)
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=0, best_offset=0),
+        )
+        return sid
+
+    def test_resume_rejects_malformed_or_changed_snapshot(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        topo = self._mark_vcache(simple_topology)
+        bad = self._policy_session(db, topo, policy_json="{")
+        eng = TunerEngine(db, topo, mock_smu, mock_backend)
+        messages = []
+        eng.log_message.connect(messages.append)
+        eng.resume(bad)
+        assert any("malformed policy_json" in message for message in messages)
+
+        sid = self._policy_session(db, topo)
+        topo.cores[0] = type(topo.cores[0])(0, 1, None, topo.cores[0].logical_cpus, False)
+        eng.resume(sid)
+        assert any("topology changed" in message for message in messages)
+
+    def test_resume_keeps_snapshot_when_cache_evidence_disappears(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        topo = self._mark_vcache(simple_topology)
+        sid = self._policy_session(db, topo)
+        topo.ccd_l3_sizes_kib = {}
+        eng = TunerEngine(db, topo, mock_smu, mock_backend)
+        messages = []
+        eng.log_message.connect(messages.append)
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid)
+        assert eng.policy_snapshot is not None
+        assert any("temporarily unavailable" in message for message in messages)
+
+    def test_validate_refuses_bad_and_changed_policy(self, db, simple_topology, mock_smu, mock_backend):
+        topo = self._mark_vcache(simple_topology)
+        eng = TunerEngine(db, topo, mock_smu, mock_backend)
+        messages = []
+        eng.log_message.connect(messages.append)
+        bad = self._policy_session(db, topo, policy_json="{")
+        eng.validate_profile(bad)
+        assert any("Cannot validate: malformed" in message for message in messages)
+
+        changed = self._policy_session(db, topo)
+        topo.cores[0] = type(topo.cores[0])(0, 1, None, topo.cores[0].logical_cpus, False)
+        eng.validate_profile(changed)
+        assert any("Cannot validate: physical core/CCD topology changed" in message for message in messages)
+
+    def test_validate_legacy_session_uses_uniform_policy(self, db, simple_topology, mock_smu, mock_backend):
+        sid = self._policy_session(db, simple_topology, policy_json="{}")
+        eng = TunerEngine(db, simple_topology, mock_smu, mock_backend)
+        with patch.object(eng, "_run_next"):
+            eng.validate_profile(sid)
+        assert eng.policy_snapshot is None
+        assert eng._core_policies[0].source == "global"
+
+
 class TestBackoffAlgorithm:
     """Test the backoff/binary-search algorithm after failed confirmation."""
 

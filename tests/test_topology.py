@@ -532,6 +532,9 @@ class TestDataclasses:
         assert topo.ccds == 0
         assert topo.is_x3d is False
         assert topo.vcache_ccd is None
+        assert topo.vcache_ccds == frozenset()
+        assert topo.ccd_l3_sizes_kib == {}
+        assert topo.x3d_detection == "none"
         assert topo.cores == {}
         assert topo.logical_map == {}
 
@@ -612,8 +615,8 @@ class TestTopologyEdgeCases:
 
         assert topo.vcache_ccd == 0
 
-    def test_x3d_equal_l3_sizes_no_vcache_detected(self, tmp_path):
-        """If both CCDs report same L3 size, V-Cache CCD detection is arbitrary but doesn't crash."""
+    def test_x3d_equal_l3_sizes_is_ambiguous_without_guessing(self, tmp_path):
+        """Equal standard-size caches cannot safely identify a V-Cache CCD."""
         topo = CPUTopology()
         topo.model_name = "AMD Ryzen 9 7950X3D 16-Core Processor"
         topo.ccds = 2
@@ -633,7 +636,47 @@ class TestTopologyEdgeCases:
         with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
             _detect_x3d(topo)
 
-        assert topo.vcache_ccd is not None
+        assert topo.vcache_ccd is None
+        assert topo.vcache_ccds == frozenset()
+        assert topo.x3d_detection == "ambiguous"
+
+    def test_dual_vcache_marks_every_ccd_and_has_no_singular_alias(self, tmp_path):
+        topo = CPUTopology(model_name="AMD Ryzen X3D", ccds=2)
+        topo.cores = {
+            0: PhysicalCore(0, 0, None, (0,)),
+            8: PhysicalCore(8, 1, None, (8,)),
+        }
+        cpu_dir = tmp_path / "cpu"
+        for core in topo.cores.values():
+            cache = cpu_dir / f"cpu{core.logical_cpus[0]}" / "cache" / "index3"
+            cache.mkdir(parents=True)
+            (cache / "level").write_text("3")
+            (cache / "size").write_text("96M")
+        with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
+            _detect_x3d(topo)
+        assert topo.vcache_ccds == frozenset({0, 1})
+        assert topo.vcache_ccd is None
+        assert all(core.has_vcache for core in topo.cores.values())
+        assert topo.x3d_detection == "cache_verified"
+
+    def test_cache_only_reversed_ccd_signature(self, tmp_path):
+        topo = CPUTopology(model_name="AMD Engineering Sample", ccds=2)
+        topo.cores = {
+            0: PhysicalCore(0, 0, None, (0,)),
+            8: PhysicalCore(8, 1, None, (8,)),
+        }
+        cpu_dir = tmp_path / "cpu"
+        for core in topo.cores.values():
+            cache = cpu_dir / f"cpu{core.logical_cpus[0]}" / "cache" / "index3"
+            cache.mkdir(parents=True)
+            (cache / "level").write_text("3")
+            (cache / "size").write_text("96M" if core.ccd == 1 else "32M")
+        with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
+            _detect_x3d(topo)
+        assert topo.is_x3d is True
+        assert topo.vcache_ccds == frozenset({1})
+        assert topo.vcache_ccd == 1
+        assert topo.x3d_detection == "cache_only"
 
     def test_missing_core_id_in_cpuinfo(self):
         """cpuinfo with processor but no core_id should not crash."""

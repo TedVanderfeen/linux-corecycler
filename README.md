@@ -46,6 +46,10 @@ Read this before using the Curve Optimizer features. Full scope in [SECURITY.md]
 - **CO is written in only two places** -- the Curve Optimizer tab (per-core, each write behind a confirmation dialog, with dry-run and backup/restore) and the Auto-Tuner. They are mutually exclusive -- the tab is locked while the tuner runs.
 - **The automatic tuner is crash-safe** -- a CO write-ahead journal records every value before it is applied, CO=0 (stock) is the only floor it trusts, and a resume-crash circuit breaker forces all cores to stock and quarantines a profile that keeps crashing -- so no sequence of crashes, reboots, or resumes can loop the machine into re-crashing. See [Crash safety](docs/usage.md#crash-safety).
 - **Thermal protection** -- a configurable temperature limit (default 95C) pauses testing; the tuner fails closed if no temperature sensor is readable.
+- **X3D values are not guaranteed safe** -- hardware-supported CO ranges are only
+  command limits. Unstable values can crash the machine, corrupt data, and may
+  degrade or damage silicon. Positive CO is especially sensitive on V-Cache cores
+  and requires a separate acknowledgement.
 
 ## Installation
 
@@ -90,6 +94,9 @@ group elsewhere -- see [docs/installation.md](docs/installation.md#device-access
 Pick a backend and preset in the Configuration tab and click **Start Test**, or use the
 **Auto-Tuner** tab to search every core's stable offset automatically. If a backend is
 reported as not found, `corecycler doctor` prints where it looked and what it found. The
+`corecycler topology` command prints per-CCD L3 evidence, X3D classification, and
+V-Cache membership. `corecycler tune` refuses positive X3D searches unless
+`--accept-x3d-positive` is supplied.
 full guide -- manual tuning workflow, the Auto-Tuner, and reading results -- is in
 [docs/usage.md](docs/usage.md).
 

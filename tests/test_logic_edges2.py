@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -35,6 +36,11 @@ class TestSettingsCoProfile:
         settings.save_co_profile({0: -30, 5: -15}, p, cpu_model="Ryzen", source="tuner")
         assert p.exists()
         assert settings.load_co_profile(p) == {0: -30, 5: -15}
+
+    def test_save_profile_includes_policy_groups(self, tmp_path):
+        p = tmp_path / "grouped.json"
+        settings.save_co_profile({0: -20}, p, policy_groups={"vcache": [0]})
+        assert json.loads(p.read_text())["ccd_classes"] == {"vcache": [0]}
 
 
 class TestLoggerEarlyReturns:

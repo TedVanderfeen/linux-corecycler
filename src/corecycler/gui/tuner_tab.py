@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -42,6 +43,7 @@ from corecycler.history.timefmt import format_local
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
+from corecycler.tuner.policy import resolve_policy
 from corecycler.tuner.state import TunerPhase
 
 if TYPE_CHECKING:
@@ -244,6 +246,11 @@ class TunerTab(QWidget):
         self._start_offset_spin.setToolTip("Starting CO value for all cores (0 = BIOS baseline)")
         search_layout.addRow("Start offset:", self._start_offset_spin)
 
+        self._direction_combo = QComboBox()
+        self._direction_combo.addItem("Negative / undervolt", -1)
+        self._direction_combo.addItem("Positive / overvolt", 1)
+        search_layout.addRow("Search direction:", self._direction_combo)
+
         self._inherit_current_check = QCheckBox("Inherit current CO from SMU")
         self._inherit_current_check.setToolTip(
             "Read current CO offsets from SMU at session start and use them\n"
@@ -407,6 +414,50 @@ class TunerTab(QWidget):
         columns.addLayout(right_col)
         parent_layout.addLayout(columns)
 
+        x3d_group = QGroupBox("X3D Per-Core Policy")
+        x3d_layout = QFormLayout(x3d_group)
+        self._x3d_mode_combo = QComboBox()
+        self._x3d_mode_combo.addItems(["auto", "off", "force"])
+        self._x3d_mode_combo.setToolTip(
+            "auto uses unambiguous L3 evidence; off uses uniform settings; force uses the CCD list below"
+        )
+        x3d_layout.addRow("Mode:", self._x3d_mode_combo)
+        self._x3d_force_ccds = QLineEdit()
+        self._x3d_force_ccds.setPlaceholderText("e.g. 0 or 0,1 (required in force mode)")
+        x3d_layout.addRow("Forced V-Cache CCDs:", self._x3d_force_ccds)
+        self._x3d_floor_spin = QSpinBox()
+        self._x3d_floor_spin.setRange(-60, 0)
+        self._x3d_floor_spin.setValue(-25)
+        x3d_layout.addRow("V-Cache negative floor:", self._x3d_floor_spin)
+        self._x3d_step_spin = QSpinBox()
+        self._x3d_step_spin.setRange(1, 15)
+        self._x3d_step_spin.setValue(3)
+        x3d_layout.addRow("V-Cache coarse step:", self._x3d_step_spin)
+        self._x3d_confirm_spin = QDoubleSpinBox()
+        self._x3d_confirm_spin.setRange(1.0, 10.0)
+        self._x3d_confirm_spin.setSingleStep(0.1)
+        self._x3d_confirm_spin.setValue(1.5)
+        self._x3d_confirm_spin.setSuffix("×")
+        x3d_layout.addRow("V-Cache confirmation:", self._x3d_confirm_spin)
+        self._core_policy_overrides = QLineEdit()
+        self._core_policy_overrides.setPlaceholderText(
+            '{"0":{"max_offset":-20,"coarse_step":2,"confirm_multiplier":2.0}}'
+        )
+        x3d_layout.addRow("Advanced core overrides:", self._core_policy_overrides)
+        evidence = []
+        if self._topology:
+            for ccd, size in sorted(self._topology.ccd_l3_sizes_kib.items()):
+                evidence.append(f"CCD {ccd}: {size / 1024:g} MiB")
+            detection = self._topology.x3d_detection
+        else:
+            detection = "unavailable"
+        self._x3d_evidence_label = QLabel(
+            f"Detection: {detection}; " + (", ".join(evidence) if evidence else "L3 evidence unavailable")
+        )
+        self._x3d_evidence_label.setWordWrap(True)
+        x3d_layout.addRow("Detected topology:", self._x3d_evidence_label)
+        parent_layout.addWidget(x3d_group)
+
         # Defaults button
         btn_row = QHBoxLayout()
         defaults_btn = QPushButton("Load Defaults")
@@ -416,8 +467,19 @@ class TunerTab(QWidget):
         parent_layout.addLayout(btn_row)
 
     def _get_config(self) -> TunerConfig:
+        forced_raw = self._x3d_force_ccds.text().strip()
+        try:
+            forced_ccds = [int(value.strip()) for value in forced_raw.split(",") if value.strip()]
+        except ValueError:
+            forced_ccds = [-1]
+        overrides_raw = self._core_policy_overrides.text().strip()
+        try:
+            overrides = json.loads(overrides_raw) if overrides_raw else {}
+        except json.JSONDecodeError:
+            overrides = {"invalid-json": {}}
         return TunerConfig(
             start_offset=self._start_offset_spin.value(),
+            direction=int(self._direction_combo.currentData()),
             coarse_step=self._coarse_step_spin.value(),
             fine_step=self._fine_step_spin.value(),
             max_offset=self._max_offset_spin.value(),
@@ -432,6 +494,12 @@ class TunerTab(QWidget):
             backend=self._backend_combo.currentText(),
             stress_mode=self._mode_combo.currentText(),
             fft_preset=self._fft_combo.currentText(),
+            x3d_mode=self._x3d_mode_combo.currentText(),
+            x3d_force_vcache_ccds=forced_ccds,
+            x3d_vcache_negative_floor=self._x3d_floor_spin.value(),
+            x3d_vcache_coarse_step=self._x3d_step_spin.value(),
+            x3d_vcache_confirm_multiplier=self._x3d_confirm_spin.value(),
+            core_policy_overrides=overrides,
         )
 
     def _load_defaults(self) -> None:
@@ -445,6 +513,7 @@ class TunerTab(QWidget):
         in the boxes from before.
         """
         self._start_offset_spin.setValue(cfg.start_offset)
+        self._direction_combo.setCurrentIndex(0 if cfg.direction < 0 else 1)
         self._coarse_step_spin.setValue(cfg.coarse_step)
         self._fine_step_spin.setValue(cfg.fine_step)
         self._max_offset_spin.setValue(cfg.max_offset)
@@ -459,6 +528,12 @@ class TunerTab(QWidget):
         self._backend_combo.setCurrentText(cfg.backend)
         self._mode_combo.setCurrentText(cfg.stress_mode)
         self._fft_combo.setCurrentText(cfg.fft_preset)
+        self._x3d_mode_combo.setCurrentText(cfg.x3d_mode)
+        self._x3d_force_ccds.setText(",".join(map(str, cfg.x3d_force_vcache_ccds)))
+        self._x3d_floor_spin.setValue(cfg.x3d_vcache_negative_floor)
+        self._x3d_step_spin.setValue(cfg.x3d_vcache_coarse_step)
+        self._x3d_confirm_spin.setValue(cfg.x3d_vcache_confirm_multiplier)
+        self._core_policy_overrides.setText(json.dumps(cfg.core_policy_overrides, separators=(",", ":")))
 
     # ------------------------------------------------------------------
     # Actions
@@ -487,6 +562,52 @@ class TunerTab(QWidget):
             )
             return
 
+        config = self._get_config()
+        errors = config.validate()
+        if errors:
+            QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
+            return
+        try:
+            co_range = getattr(getattr(self._smu, "commands", None), "co_range", (-60, 60))
+            if not isinstance(co_range, tuple) or len(co_range) != 2:
+                co_range = (-60, 60)
+            preview = resolve_policy(
+                config,
+                self._topology,
+                co_range,
+                positive_acknowledged=True,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid X3D Policy", str(exc))
+            return
+        groups: dict[str, list[str]] = {"V-Cache": [], "Standard/Frequency": []}
+        for core, policy in sorted(preview.policies.items()):
+            label = "V-Cache" if policy.core_class == "vcache" else "Standard/Frequency"
+            groups[label].append(
+                f"C{core}: limit {policy.max_offset}, step {policy.coarse_step}, confirm {policy.confirm_multiplier:g}×"
+            )
+        summary = "\n".join(
+            [
+                f"Detection: {preview.x3d['detection']} ({preview.x3d['mapping_source']})",
+                *(f"WARNING: {warning}" for warning in preview.warnings),
+                *(f"\n{label}:\n" + ", ".join(values) for label, values in groups.items() if values),
+            ]
+        )
+        positive_ack = config.direction < 0 or not preview.x3d["effective_vcache_ccds"]
+        if not positive_ack:
+            reply = QMessageBox.warning(
+                self,
+                "Positive X3D Curve Optimizer Warning",
+                summary
+                + "\n\nPositive CO increases voltage. V-Cache silicon may be especially sensitive; "
+                "instability, corruption, degradation, or damage are possible. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            positive_ack = True
+
         reply = QMessageBox.warning(
             self,
             "Start Auto-Tuner",
@@ -496,7 +617,8 @@ class TunerTab(QWidget):
             "Positive CO offsets increase voltage and can degrade or damage "
             "hardware (especially V-Cache / X3D processors).\n\n"
             "Values are volatile and reset on reboot.\n\n"
-            "Continue?",
+            + summary
+            + "\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -507,17 +629,13 @@ class TunerTab(QWidget):
         if backend is None:
             return
 
-        config = self._get_config()
-        errors = config.validate()
-        if errors:
-            QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
-            return
         self._engine = TunerEngine(
             db=self._db,
             topology=self._topology,
             smu=self._smu,
             backend=backend,
             config=config,
+            accept_x3d_positive=positive_ack,
         )
         self._wire_engine()
 
@@ -730,7 +848,22 @@ class TunerTab(QWidget):
             cpu_model = self._topology.model_name
 
         try:
-            save_co_profile(profile, Path(path), cpu_model=cpu_model, source="auto-tuner")
+            session = tp.get_session(self._db, self._engine.session_id)
+            groups: dict[str, list[int]] = {}
+            if session is not None:
+                from corecycler.tuner.policy import PolicySnapshot
+
+                snapshot = PolicySnapshot.from_json(session.policy_json)
+                if snapshot is not None:
+                    for core, policy in snapshot.policies.items():
+                        groups.setdefault(policy.core_class, []).append(core)
+            save_co_profile(
+                profile,
+                Path(path),
+                cpu_model=cpu_model,
+                source="auto-tuner",
+                policy_groups=groups,
+            )
             QMessageBox.information(self, "Exported", f"CO profile exported to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to export: {e}")

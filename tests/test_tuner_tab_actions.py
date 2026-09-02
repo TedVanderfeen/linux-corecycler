@@ -128,6 +128,34 @@ class TestConfigPanel:
         restored = tab._get_config()
         assert replace(restored, backend=defaults.backend) == defaults
 
+    def test_x3d_evidence_and_typed_fields_roundtrip(self, db):
+        topo = _topo()
+        topo.x3d_detection = "cache_verified"
+        topo.ccd_l3_sizes_kib = {0: 98304}
+        tab = _tab(db=db, topology=topo, smu=_smu())
+        cfg = TunerConfig(
+            direction=1,
+            x3d_mode="force",
+            x3d_force_vcache_ccds=[0],
+            x3d_vcache_negative_floor=-20,
+            x3d_vcache_coarse_step=2,
+            x3d_vcache_confirm_multiplier=2.0,
+            core_policy_overrides={"0": {"max_offset": 5}},
+        )
+        tab._apply_config_to_ui(cfg)
+        restored = tab._get_config()
+        assert restored.direction == 1
+        assert restored.x3d_force_vcache_ccds == [0]
+        assert restored.core_policy_overrides == {"0": {"max_offset": 5}}
+        assert "96 MiB" in tab._x3d_evidence_label.text()
+
+    def test_malformed_guided_inputs_fail_closed(self, tab):
+        tab._x3d_force_ccds.setText("not-a-ccd")
+        tab._core_policy_overrides.setText("{")
+        cfg = tab._get_config()
+        assert cfg.x3d_force_vcache_ccds == [-1]
+        assert cfg.validate()
+
 
 class TestStart:
     def test_refuses_without_db_or_topology(self, no_modal):
@@ -174,6 +202,45 @@ class TestStart:
         tab._on_start()
         assert not engine_cls.called
         assert no_modal.warning.call_args.args[1] == "Invalid Configuration"
+
+    def test_refuses_a_forced_mapping_to_a_missing_ccd(self, tab, no_modal, monkeypatch):
+        monkeypatch.setattr(
+            tab,
+            "_get_config",
+            lambda: TunerConfig(x3d_mode="force", x3d_force_vcache_ccds=[9]),
+        )
+        tab._on_start()
+        assert no_modal.warning.call_args.args[1] == "Invalid X3D Policy"
+
+    def test_positive_x3d_has_separate_blocking_confirmation(self, db, no_modal, monkeypatch):
+        topo = _topo()
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "cache_verified"
+        smu = _smu()
+        smu.commands.co_range = (-60, 10)
+        tab = _tab(db=db, topology=topo, smu=smu, backend_factory=lambda _n: _backend())
+        monkeypatch.setattr(tab, "_get_config", lambda: TunerConfig(direction=1, max_offset=5))
+        engine_cls = MagicMock()
+        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
+        no_modal.warning.return_value = no_modal.StandardButton.No
+        tab._on_start()
+        assert no_modal.warning.call_args.args[1] == "Positive X3D Curve Optimizer Warning"
+        assert not engine_cls.called
+
+    def test_positive_x3d_ack_is_given_to_engine(self, db, no_modal, monkeypatch):
+        topo = _topo()
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "cache_verified"
+        smu = _smu()
+        smu.commands.co_range = (-60, 10)
+        tab = _tab(db=db, topology=topo, smu=smu, backend_factory=lambda _n: _backend())
+        monkeypatch.setattr(tab, "_get_config", lambda: TunerConfig(direction=1, max_offset=5))
+        eng = _engine(status="running")
+        engine_cls = MagicMock(return_value=eng)
+        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
+        no_modal.warning.side_effect = [no_modal.StandardButton.Yes, no_modal.StandardButton.Yes]
+        tab._on_start()
+        assert engine_cls.call_args.kwargs["accept_x3d_positive"] is True
 
     def test_an_engine_that_refuses_to_start_leaves_the_ui_idle(self, tab, no_modal, monkeypatch):
         eng = _engine(status="idle")
@@ -456,6 +523,27 @@ class TestExport:
             tab._on_export()
         assert json.loads(out.read_text())["offsets"] == {"0": -30}
         assert no_modal.information.called
+
+    def test_policy_aware_export_contains_ccd_classes(self, tab, tmp_path):
+        from corecycler.tuner.policy import resolve_policy
+
+        topo = tab._topology
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "cache_verified"
+        cfg = TunerConfig(cores_to_test=[0, 1])
+        policy = resolve_policy(cfg, topo, (-60, 10)).to_json()
+        sid = tp.create_session(tab._db, cfg, "", topo.model_name, policy_json=policy)
+        for core in (0, 1):
+            tp.save_core_state(
+                tab._db,
+                sid,
+                CoreState(core_id=core, phase=TunerPhase.CONFIRMED, best_offset=-20),
+            )
+        tab._engine = _engine(session_id=sid)
+        out = tmp_path / "grouped.json"
+        with patch("corecycler.gui.tuner_tab.QFileDialog.getSaveFileName", return_value=(str(out), "")):
+            tab._on_export()
+        assert json.loads(out.read_text())["ccd_classes"] == {"vcache": [0, 1]}
 
     def test_a_failed_write_is_surfaced(self, tab, tmp_path, no_modal, monkeypatch):
         sid = _seed_session(tab._db)

@@ -64,6 +64,8 @@ class TunerSession:
     bios_version: str = ""
     cpu_model: str = ""
     config_json: str = "{}"
+    # Empty object is the compatibility marker for pre-X3D-policy sessions.
+    policy_json: str = "{}"
     context_id: int | None = None
     resume_crash_streak: int = 0
     notes: str = ""

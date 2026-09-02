@@ -25,9 +25,10 @@ def create_session(
     bios_version: str,
     cpu_model: str,
     context_id: int | None = None,
+    policy_json: str = "{}",
 ) -> int:
     """Create a new tuner session. Returns the session id."""
-    return db.create_tuner_session(config.to_json(), bios_version, cpu_model, context_id)
+    return db.create_tuner_session(config.to_json(), bios_version, cpu_model, context_id, policy_json)
 
 
 def update_session_status(db: HistoryDB, session_id: int, status: str) -> None:

@@ -126,6 +126,7 @@ def save_co_profile(
     path: Path,
     cpu_model: str = "",
     source: str = "manual",
+    policy_groups: dict[str, list[int]] | None = None,
 ) -> None:
     """Save a CO offset profile to a JSON file."""
     from datetime import datetime
@@ -138,6 +139,8 @@ def save_co_profile(
         "source": source,
         "offsets": {str(k): v for k, v in sorted(offsets.items())},
     }
+    if policy_groups:
+        data["ccd_classes"] = policy_groups
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, json.dumps(data, indent=2))
 

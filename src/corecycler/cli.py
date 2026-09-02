@@ -26,8 +26,10 @@ USAGE = """\
 corecycler headless commands:
 
   corecycler doctor               report every external tool and where it resolved
+  corecycler topology             show CCD cache evidence and X3D classification
   corecycler status               list tuner sessions and their state
-  corecycler tune [--config F]    start a NEW tuning session and run to the end
+  corecycler tune [--config F] [--accept-x3d-positive]
+                                   start a NEW tuning session and run to the end
   corecycler resume [SESSION_ID]  resume a mid-run/paused session (newest if omitted)
 
 Exit codes: 0 completed, 3 paused (needs attention), 4 quarantined,
@@ -42,6 +44,8 @@ def cli_main(argv: list[str]) -> int:
     command = argv[0]
     if command == "doctor":
         return cmd_doctor()
+    if command == "topology":
+        return cmd_topology()
     if command == "status":
         return cmd_status()
     if command == "tune":
@@ -49,7 +53,10 @@ def cli_main(argv: list[str]) -> int:
         if config_path is _INVALID:
             print("corecycler tune: --config requires a file path", file=sys.stderr)
             return EXIT_REFUSED
-        return cmd_run(config_path=config_path, resume_id=None, auto_resume=False)
+        kwargs = {"config_path": config_path, "resume_id": None, "auto_resume": False}
+        if "--accept-x3d-positive" in argv[1:]:
+            kwargs["accept_x3d_positive"] = True
+        return cmd_run(**kwargs)
     if command == "resume":
         rest = [a for a in argv[1:] if not a.startswith("-")]
         if len(rest) > 1:
@@ -99,6 +106,31 @@ def cmd_doctor() -> int:
     return EXIT_REFUSED if unmet else EXIT_COMPLETED
 
 
+def topology_lines(topology) -> list[str]:
+    lines = [
+        topology.model_name or "Unknown CPU",
+        f"X3D detection: {topology.x3d_detection}",
+        f"V-Cache CCDs: {','.join(map(str, sorted(topology.vcache_ccds))) or 'none'}",
+    ]
+    for ccd in sorted({info.ccd for info in topology.cores.values() if info.ccd is not None}):
+        size = topology.ccd_l3_sizes_kib.get(ccd)
+        evidence = f"{size / 1024:g} MiB L3" if size is not None else "L3 unavailable"
+        kind = "V-Cache" if ccd in topology.vcache_ccds else "Standard/Frequency"
+        cores = [core for core, info in sorted(topology.cores.items()) if info.ccd == ccd]
+        lines.append(f"CCD {ccd}: {kind}; {evidence}; cores {cores}")
+    if topology.x3d_detection == "ambiguous":
+        lines.append("WARNING: mapping is ambiguous; automatic tuning will use uniform global policy.")
+    return lines
+
+
+def cmd_topology() -> int:
+    from corecycler.engine.topology import detect_topology
+
+    for line in topology_lines(detect_topology()):
+        print(line)
+    return EXIT_COMPLETED
+
+
 def _flag_value(args: list[str], flag: str):
     if flag not in args:
         return None
@@ -127,6 +159,22 @@ def cmd_status(db=None) -> int:
                 f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
                 f"created {sess.created_at[:19]}  {sess.cpu_model or ''}"
             )
+            from corecycler.tuner.policy import PolicySnapshot
+
+            try:
+                snapshot = PolicySnapshot.from_json(sess.policy_json)
+            except ValueError:
+                print("  policy: INVALID (session will refuse resume)")
+                continue
+            if snapshot is not None:
+                for label, core_class in (("V-Cache", "vcache"), ("Standard/Frequency", "standard")):
+                    members = [
+                        f"C{core}={states[core].best_offset if core in states else '?'}"
+                        for core, policy in sorted(snapshot.policies.items())
+                        if policy.core_class == core_class
+                    ]
+                    if members:
+                        print(f"  {label}: {', '.join(members)}")
         return EXIT_COMPLETED
     finally:
         if own_db:
@@ -154,6 +202,7 @@ def cmd_run(
     resume_id: int | None,
     auto_resume: bool,
     *,
+    accept_x3d_positive: bool = False,
     engine_factory=None,
     db=None,
 ) -> int:
@@ -223,7 +272,16 @@ def cmd_run(
                 file=sys.stderr,
             )
             return EXIT_REFUSED
-        engine = TunerEngine(db=db, topology=topology, smu=smu, backend=backend, config=config)
+        for line in topology_lines(topology):
+            print(line)
+        engine = TunerEngine(
+            db=db,
+            topology=topology,
+            smu=smu,
+            backend=backend,
+            config=config,
+            accept_x3d_positive=accept_x3d_positive,
+        )
 
     outcome: dict[str, int] = {}
 

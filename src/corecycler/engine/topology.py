@@ -40,6 +40,11 @@ class CPUTopology:
     ccds: int = 0
     is_x3d: bool = False
     vcache_ccd: int | None = None
+    vcache_ccds: frozenset[int] = field(default_factory=frozenset)
+    ccd_l3_sizes_kib: dict[int, int] = field(default_factory=dict)
+    # none, model_only, cache_verified, cache_only, or ambiguous.  Consumers
+    # must not infer a V-Cache CCD when this says ambiguous.
+    x3d_detection: str = "none"
     # False when a present CPU is offline. A fully-offlined core vanishes from
     # /proc/cpuinfo and fakes a hole in the core-id space, so gap-based
     # physical-numbering proofs are only trustworthy when this is True.
@@ -244,24 +249,23 @@ def _detect_ccd_layout(topo: CPUTopology) -> None:
 
 
 def _detect_x3d(topo: CPUTopology) -> None:
-    """Detect X3D processors and identify V-Cache CCD."""
+    """Detect X3D processors and identify every V-Cache CCD.
+
+    A 96 MiB-or-larger per-CCD L3 is a strong V-Cache signature.  A model
+    marker can identify a single-CCD part without cache telemetry, but it is
+    deliberately insufficient to guess a CCD on a multi-CCD part.
+    """
     name_lower = topo.model_name.lower()
+    model_x3d = "x3d" in name_lower
 
-    # X3D detection: model name contains "x3d" or known X3D part numbers
-    x3d_patterns = ["x3d", "7800x3d", "7900x3d", "7950x3d", "9800x3d", "9900x3d", "9950x3d"]
-    topo.is_x3d = any(pat in name_lower for pat in x3d_patterns)
+    # Clear prior results so re-detection (used by diagnostics/tests) is safe.
+    topo.vcache_ccd = None
+    topo.vcache_ccds = frozenset()
+    topo.ccd_l3_sizes_kib = {}
+    topo.x3d_detection = "none"
+    for pc in topo.cores.values():
+        object.__setattr__(pc, "has_vcache", False)
 
-    if not topo.is_x3d or topo.ccds < 2:
-        if topo.is_x3d and topo.ccds == 1:
-            # single CCD X3D (e.g., 7800X3D) — the one CCD has V-Cache
-            topo.vcache_ccd = 0
-            for pc in topo.cores.values():
-                if pc.ccd == 0:
-                    object.__setattr__(pc, "has_vcache", True)
-        return
-
-    # multi-CCD X3D: CCD0 has V-Cache (larger L3)
-    # detect by comparing L3 sizes per CCD
     ccd_l3_sizes: dict[int, int] = {}
     for core in topo.cores.values():
         if core.ccd is None:
@@ -287,13 +291,34 @@ def _detect_x3d(topo: CPUTopology) -> None:
                         ccd_l3_sizes[core.ccd] = val * multiplier.get(unit, 1)
                 break
 
-    if ccd_l3_sizes:
-        # V-Cache CCD has the largest L3
-        vcache_ccd = max(ccd_l3_sizes, key=lambda c: ccd_l3_sizes[c])
-        topo.vcache_ccd = vcache_ccd
-        for pc in topo.cores.values():
-            if pc.ccd == vcache_ccd:
-                object.__setattr__(pc, "has_vcache", True)
+    topo.ccd_l3_sizes_kib = ccd_l3_sizes
+    enlarged = frozenset(ccd for ccd, size in ccd_l3_sizes.items() if size >= 96 * 1024)
+    known_ccds = {pc.ccd for pc in topo.cores.values() if pc.ccd is not None}
+    complete = bool(known_ccds) and known_ccds <= ccd_l3_sizes.keys()
+
+    detected: frozenset[int] = frozenset()
+    if enlarged:
+        detected = enlarged
+        topo.is_x3d = True
+        topo.x3d_detection = "cache_verified" if model_x3d else "cache_only"
+    elif model_x3d and topo.ccds == 1:
+        detected = frozenset({0})
+        topo.is_x3d = True
+        topo.x3d_detection = "model_only"
+    elif model_x3d:
+        # Equal 32 MiB readings, missing cache files, and other contradictory
+        # multi-CCD evidence cannot safely identify which CCD is stacked.
+        topo.is_x3d = True
+        topo.x3d_detection = "ambiguous"
+    else:
+        topo.is_x3d = False
+        topo.x3d_detection = "none" if complete or not ccd_l3_sizes else "ambiguous"
+
+    topo.vcache_ccds = detected
+    topo.vcache_ccd = next(iter(detected)) if len(detected) == 1 else None
+    for pc in topo.cores.values():
+        if pc.ccd in detected:
+            object.__setattr__(pc, "has_vcache", True)
 
 
 def get_first_logical_cpu(topo: CPUTopology, physical_core: int) -> int:

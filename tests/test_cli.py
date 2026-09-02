@@ -96,6 +96,16 @@ class TestArgHandling:
     def test_resume_rejects_multiple_ids(self):
         assert cli.cli_main(["resume", "1", "2"]) == cli.EXIT_REFUSED
 
+    def test_positive_x3d_acceptance_flag_is_forwarded(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(cli, "cmd_run", lambda **kwargs: seen.update(kwargs) or 0)
+        assert cli.cli_main(["tune", "--accept-x3d-positive"]) == 0
+        assert seen["accept_x3d_positive"] is True
+
+    def test_topology_dispatches(self, monkeypatch):
+        monkeypatch.setattr(cli, "cmd_topology", lambda: 17)
+        assert cli.cli_main(["topology"]) == 17
+
 
 class TestStatus:
     def test_empty_db(self, db, capsys):
@@ -131,6 +141,43 @@ class TestStatus:
         assert f"#{sid}" in out
         assert "paused" in out
         assert "1/2 cores done" in out
+
+    def test_lists_policy_groups_and_invalid_policy(self, db, capsys):
+        from corecycler.tuner.policy import resolve_policy
+
+        topo = _fake_topology()
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "cache_verified"
+        cfg = TunerConfig(cores_to_test=[0, 8])
+        policy = resolve_policy(cfg, topo, (-60, 10)).to_json()
+        sid = tp.create_session(db, cfg, "", topo.model_name, policy_json=policy)
+        tp.save_core_state(db, sid, CoreState(core_id=0, best_offset=-20))
+        tp.save_core_state(db, sid, CoreState(core_id=8, best_offset=-40))
+        cli.cmd_status(db=db)
+        out = capsys.readouterr().out
+        assert "V-Cache: C0=-20" in out
+        assert "Standard/Frequency: C8=-40" in out
+
+        bad = tp.create_session(db, cfg, "", topo.model_name, policy_json="{")
+        cli.cmd_status(db=db)
+        out = capsys.readouterr().out
+        assert f"#{bad}" in out
+        assert "policy: INVALID" in out
+
+
+class TestTopologyOutput:
+    def test_evidence_and_ambiguity_lines(self, capsys, monkeypatch):
+        topo = _fake_topology()
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "ambiguous"
+        topo.ccd_l3_sizes_kib = {0: 98304}
+        lines = cli.topology_lines(topo)
+        assert any("96 MiB" in line for line in lines)
+        assert any("L3 unavailable" in line for line in lines)
+        assert any("WARNING" in line for line in lines)
+        monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: topo)
+        assert cli.cmd_topology() == 0
+        assert "X3D detection" in capsys.readouterr().out
 
 
 class TestRunOutcomes:

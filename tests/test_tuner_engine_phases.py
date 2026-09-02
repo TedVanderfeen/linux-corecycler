@@ -1237,8 +1237,11 @@ class TestRemainingEvidencePaths:
 
 class TestSearchArithmetic:
     def test_a_first_coarse_step_past_the_limit_is_clamped(self, engine):
-        engine._config.coarse_step = 90
-        engine._config.max_offset = -30
+        from corecycler.tuner.policy import CorePolicy
+
+        # A running session follows its immutable resolved snapshot, not later
+        # edits to the mutable configuration object.
+        engine._core_policies[0] = CorePolicy(max_offset=-30, coarse_step=90)
         cs = engine._core_states[0]
         cs.phase = TunerPhase.NOT_STARTED
         cs.current_offset = 0

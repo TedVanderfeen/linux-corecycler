@@ -42,6 +42,16 @@ class TunerConfig:
     fine_step: int = 1
     direction: int = -1  # -1 = negative (undervolting), +1 = positive
 
+    # X3D-aware per-core policy.  Automatic detection only applies a policy
+    # when V-Cache CCD membership is unambiguous; force mode requires the
+    # operator to name it.  Explicit per-core entries have final precedence.
+    x3d_mode: str = "auto"  # auto, off, force
+    x3d_force_vcache_ccds: list[int] = dataclasses.field(default_factory=list)
+    x3d_vcache_negative_floor: int = -25
+    x3d_vcache_coarse_step: int = 3
+    x3d_vcache_confirm_multiplier: float = 1.5
+    core_policy_overrides: dict[str, dict[str, int | float]] = dataclasses.field(default_factory=dict)
+
     # Test durations (seconds)
     search_duration_seconds: int = 60
     confirm_duration_seconds: int = 300
@@ -182,6 +192,48 @@ class TunerConfig:
         errors = []
         if self.direction not in (-1, 1):
             errors.append(f"direction must be -1 or 1, got {self.direction}")
+        if self.x3d_mode not in ("auto", "off", "force"):
+            errors.append("x3d_mode must be auto, off, or force")
+        if self.x3d_mode == "force" and not self.x3d_force_vcache_ccds:
+            errors.append("x3d_force_vcache_ccds is required when x3d_mode is force")
+        if any(not isinstance(ccd, int) or isinstance(ccd, bool) or ccd < 0 for ccd in self.x3d_force_vcache_ccds):
+            errors.append("x3d_force_vcache_ccds must contain non-negative integer CCD ids")
+        if not -60 <= self.x3d_vcache_negative_floor <= 0:
+            errors.append("x3d_vcache_negative_floor must be -60..0")
+        if not 1 <= self.x3d_vcache_coarse_step <= 15:
+            errors.append("x3d_vcache_coarse_step must be 1..15")
+        if not 1.0 <= self.x3d_vcache_confirm_multiplier <= 10.0:
+            errors.append("x3d_vcache_confirm_multiplier must be 1.0..10.0")
+        if not isinstance(self.core_policy_overrides, dict):
+            errors.append("core_policy_overrides must be an object keyed by core id")
+        else:
+            for core, override in self.core_policy_overrides.items():
+                if not isinstance(core, str) or not core.isdigit():
+                    errors.append(f"core_policy_overrides key {core!r} must be a non-negative core id")
+                    continue
+                if not isinstance(override, dict):
+                    errors.append(f"core_policy_overrides[{core}] must be an object")
+                    continue
+                unknown = set(override) - {"max_offset", "coarse_step", "confirm_multiplier"}
+                if unknown:
+                    errors.append(f"core_policy_overrides[{core}] has unknown fields: {sorted(unknown)}")
+                max_value = override.get("max_offset")
+                step_value = override.get("coarse_step")
+                multiplier = override.get("confirm_multiplier")
+                if max_value is not None and (
+                    not isinstance(max_value, int) or isinstance(max_value, bool) or not -60 <= max_value <= 60
+                ):
+                    errors.append(f"core_policy_overrides[{core}].max_offset must be -60..60")
+                if step_value is not None and (
+                    not isinstance(step_value, int) or isinstance(step_value, bool) or not 1 <= step_value <= 15
+                ):
+                    errors.append(f"core_policy_overrides[{core}].coarse_step must be 1..15")
+                if multiplier is not None and (
+                    not isinstance(multiplier, (int, float))
+                    or isinstance(multiplier, bool)
+                    or not 0.1 <= multiplier <= 10.0
+                ):
+                    errors.append(f"core_policy_overrides[{core}].confirm_multiplier must be 0.1..10.0")
         if self.coarse_step < 1:
             errors.append(f"coarse_step must be >= 1, got {self.coarse_step}")
         if self.fine_step < 1:

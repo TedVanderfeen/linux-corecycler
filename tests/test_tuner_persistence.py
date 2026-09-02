@@ -309,6 +309,7 @@ class TestSchemaV11:
             ("tuner_sessions", "validation_half"),
             ("tuner_sessions", "validation_dirty"),
             ("tuner_sessions", "validation_requeue"),
+            ("tuner_sessions", "policy_json"),
             ("tuner_test_log", "peak_stretch_pct"),
         ):
             db._execute_raw(f"ALTER TABLE {table} DROP COLUMN {column}")

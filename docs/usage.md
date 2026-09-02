@@ -186,6 +186,42 @@ NOT_STARTED -> COARSE_SEARCH -> FINE_SEARCH -> SETTLED -> CONFIRMING -> CONFIRME
 | Resume Crash Quarantine Threshold | 3 | 1-20 | Crash-resumes (no surviving test between) before forcing CO=0 and quarantining |
 | Allow Missing Thermal Sensor | false | true/false | Permit running with no readable temperature sensor (false = fail closed) |
 | Inherit Current CO | false | true/false | Read current SMU offsets as starting points |
+| X3D Mode | auto | auto/off/force | Apply V-Cache policy only from unambiguous detection, disable it, or force an explicit mapping |
+| Forced V-Cache CCDs | [] | existing CCD IDs | Required in force mode; supports one or multiple V-Cache CCDs |
+| X3D Negative Floor | -25 | -60 to 0 | Least-aggressive bound applied to negative V-Cache searches (`max(global, floor)`) |
+| X3D Coarse Step | 3 | 1-15 | Smaller coarse step for V-Cache cores |
+| X3D Confirmation Multiplier | 1.5x | 1.0-10.0 | Multiplies confirmation and hardening duration for V-Cache cores |
+| Per-Core Policy Overrides | {} | JSON object | Final-precedence `max_offset`, `coarse_step`, and `confirm_multiplier` by core ID |
+
+### X3D-aware policy
+
+Automatic mode recognizes single-CCD X3D, asymmetric 96/32 MiB dual-CCD
+parts, dual-V-Cache parts, and strong 96 MiB cache-only signatures. It records
+the per-CCD L3 evidence and never guesses CCD0: incomplete or contradictory
+multi-CCD evidence produces a prominent warning and uniform global settings.
+Force mode is available when firmware or sysfs cannot expose a trustworthy map.
+
+Policy resolution order is the CPU generation's supported SMU range, global
+configuration, detected/forced X3D policy, then explicit per-core overrides.
+The exact result is stored with the session and reused on resume. A changed
+core-to-CCD topology refuses resume; temporarily missing cache telemetry does
+not reinterpret a saved session. Sessions created before policy snapshots keep
+their legacy uniform behavior.
+
+For negative searches, V-Cache cores default to a -25 floor, step 3, and 1.5x
+confirmation while standard/frequency CCDs retain global settings. Positive
+searches use the global positive ceiling but keep the smaller V-Cache step and
+longer confirmation. The GUI displays a blocking warning; the CLI requires
+`--accept-x3d-positive`.
+
+If a configured or inherited V-Cache starting value is more aggressive than
+its resolved floor, the tuner clamps it, journals the write, and verifies SMU
+readback before any workload. Failure to verify refuses the session.
+
+These are conservative search defaults, **not safe-voltage guarantees**.
+Hardware-supported ranges can still be unstable; crashes, data corruption,
+possible degradation, or damage remain possible. CO writes are volatile, but
+their consequences need not be.
 
 Abort on Consecutive Failures, Resume Crash Quarantine Threshold and Allow Missing
 Thermal Sensor are not in the panel: set them in the JSON that `corecycler tune

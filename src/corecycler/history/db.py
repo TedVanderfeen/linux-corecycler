@@ -162,7 +162,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 15
+    SCHEMA_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     bios_version        TEXT    NOT NULL DEFAULT '',
     cpu_model           TEXT    NOT NULL DEFAULT '',
     config_json         TEXT    NOT NULL DEFAULT '{}',
+    policy_json         TEXT    NOT NULL DEFAULT '{}',
     context_id          INTEGER REFERENCES tuning_contexts(id),
     resume_crash_streak INTEGER NOT NULL DEFAULT 0,
     notes               TEXT    NOT NULL DEFAULT '',
@@ -674,6 +675,11 @@ CREATE TABLE IF NOT EXISTS tuner_events (
 CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
 """
 
+    # v15 -> v16: exact per-core search policies are immutable session state.
+    @staticmethod
+    def _migrate_v16(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(conn, "tuner_sessions", [("policy_json", "TEXT NOT NULL DEFAULT '{}'")])
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -689,6 +695,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         13: _migrate_v13,
         14: _migrate_v14,
         15: _DDL_MIGRATE_V15,
+        16: _migrate_v16,
     }
 
     # ------------------------------------------------------------------
@@ -1145,6 +1152,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         bios_version: str,
         cpu_model: str,
         context_id: int | None = None,
+        policy_json: str = "{}",
     ) -> int:
         """Create a new tuner session. Returns the session id."""
         now = self._now_iso()
@@ -1152,10 +1160,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             """\
             INSERT INTO tuner_sessions
                 (created_at, updated_at, status, bios_version, cpu_model,
-                 config_json, context_id, notes)
-            VALUES (?,?,?,?,?,?,?,?)
+                 config_json, policy_json, context_id, notes)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
-            (now, now, "running", bios_version, cpu_model, config_json, context_id, ""),
+            (now, now, "running", bios_version, cpu_model, config_json, policy_json, context_id, ""),
         )
         return cur.lastrowid
 
@@ -1617,6 +1625,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             bios_version=row["bios_version"],
             cpu_model=row["cpu_model"],
             config_json=row["config_json"],
+            policy_json=row["policy_json"],
             context_id=row["context_id"],
             resume_crash_streak=row["resume_crash_streak"],
             notes=row["notes"],
@@ -1833,6 +1842,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                     "bios_version",
                     "cpu_model",
                     "config_json",
+                    "policy_json",
                     "context_id",
                     "resume_crash_streak",
                     "notes",

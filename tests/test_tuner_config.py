@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from corecycler.tuner.config import TunerConfig
 
 
@@ -128,6 +130,40 @@ class TestNewConfigOptions:
     def test_validate_transitions_default(self):
         cfg = TunerConfig()
         assert cfg.validate_transitions is True
+
+
+class TestX3DConfigValidation:
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"x3d_mode": "guess"}, "x3d_mode"),
+            ({"x3d_mode": "force"}, "required"),
+            ({"x3d_force_vcache_ccds": [-1]}, "non-negative"),
+            ({"x3d_vcache_negative_floor": -61}, "negative_floor"),
+            ({"x3d_vcache_coarse_step": 0}, "coarse_step"),
+            ({"x3d_vcache_confirm_multiplier": 0.5}, "confirm_multiplier"),
+            ({"core_policy_overrides": []}, "must be an object"),
+            ({"core_policy_overrides": {"bad": {}}}, "key"),
+            ({"core_policy_overrides": {"0": []}}, "must be an object"),
+            ({"core_policy_overrides": {"0": {"surprise": 1}}}, "unknown fields"),
+            ({"core_policy_overrides": {"0": {"max_offset": True}}}, "max_offset"),
+            ({"core_policy_overrides": {"0": {"coarse_step": 0}}}, "coarse_step"),
+            ({"core_policy_overrides": {"0": {"confirm_multiplier": False}}}, "confirm_multiplier"),
+        ],
+    )
+    def test_invalid_x3d_fields(self, kwargs, message):
+        assert any(message in error for error in TunerConfig(**kwargs).validate())
+
+    def test_x3d_defaults_and_roundtrip(self):
+        cfg = TunerConfig(
+            x3d_mode="force",
+            x3d_force_vcache_ccds=[0, 1],
+            core_policy_overrides={"0": {"max_offset": -20, "confirm_multiplier": 2.0}},
+        )
+        assert not cfg.validate()
+        restored = TunerConfig.from_json(cfg.to_json())
+        assert restored.x3d_mode == "force"
+        assert restored.core_policy_overrides == cfg.core_policy_overrides
 
     def test_validate_memory_default_and_roundtrips(self):
         cfg = TunerConfig()

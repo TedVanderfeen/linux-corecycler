@@ -134,7 +134,7 @@ def read_cpu_temperature() -> float | None:
                 name = name_file.read_text().strip()
             except OSError:
                 continue
-            if name not in ("k10temp", "coretemp", "zenpower", "zenpower3"):
+            if name not in ("k10temp", "coretemp", "zenpower", "zenpower3", "zenpower5"):
                 continue
             max_temp = 0.0
             for temp_input in sorted(hwmon_dir.glob("temp*_input")):
