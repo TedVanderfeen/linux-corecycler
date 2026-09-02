@@ -106,6 +106,13 @@ class TestArgHandling:
         monkeypatch.setattr(cli, "cmd_topology", lambda: 17)
         assert cli.cli_main(["topology"]) == 17
 
+    def test_policy_dispatch_and_missing_config_value(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(cli, "cmd_policy", lambda path, accept: seen.append((path, accept)) or 0)
+        assert cli.cli_main(["policy", "--accept-x3d-positive"]) == 0
+        assert seen == [(None, True)]
+        assert cli.cli_main(["policy", "--config"]) == cli.EXIT_REFUSED
+
 
 class TestStatus:
     def test_empty_db(self, db, capsys):
@@ -178,6 +185,51 @@ class TestTopologyOutput:
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: topo)
         assert cli.cmd_topology() == 0
         assert "X3D detection" in capsys.readouterr().out
+
+
+class TestPolicyOutput:
+    @staticmethod
+    def _x3d_topology():
+        topo = _fake_topology()
+        topo.vcache_ccds = frozenset({0})
+        topo.x3d_detection = "cache_verified"
+        topo.ccd_l3_sizes_kib = {0: 98304, 1: 32768}
+        return topo
+
+    def test_policy_lines_group_every_core_class(self):
+        from corecycler.tuner.policy import resolve_policy
+
+        cfg = TunerConfig(cores_to_test=[0, 8], x3d_mode="force", x3d_force_vcache_ccds=[1])
+        snap = resolve_policy(cfg, self._x3d_topology(), (-60, 10))
+        lines = cli.policy_lines(snap, cfg)
+        assert any(line.startswith("WARNING:") for line in lines)
+        assert any(line.startswith("V-Cache:") for line in lines)
+        assert any(line.startswith("Standard/Frequency:") for line in lines)
+
+    def test_cmd_policy_success_and_refusals(self, tmp_path, capsys, monkeypatch):
+        from unittest.mock import MagicMock
+
+        topo = self._x3d_topology()
+        monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: topo)
+        commands = MagicMock(co_range=(-60, 10))
+        monkeypatch.setattr("corecycler.smu.commands.get_commands", lambda _generation: commands)
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text(TunerConfig(direction=1, max_offset=5, cores_to_test=[0, 8]).to_json())
+        assert cli.cmd_policy(str(cfg)) == cli.EXIT_REFUSED
+        assert "acknowledgement" in capsys.readouterr().err
+        assert cli.cmd_policy(str(cfg), True) == cli.EXIT_COMPLETED
+        assert "Positive X3D acknowledgement required: yes" in capsys.readouterr().out
+        assert cli.cmd_policy(str(tmp_path / "missing")) == cli.EXIT_REFUSED
+
+        cfg.write_text(TunerConfig(coarse_step=0).to_json())
+        assert cli.cmd_policy(str(cfg)) == cli.EXIT_REFUSED
+
+    def test_cmd_policy_uses_generic_range_for_unknown_generation(self, capsys, monkeypatch):
+        topo = self._x3d_topology()
+        monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: topo)
+        monkeypatch.setattr("corecycler.smu.commands.get_commands", lambda _generation: None)
+        assert cli.cmd_policy(None) == 0
+        assert "X3D mode" in capsys.readouterr().out
 
 
 class TestRunOutcomes:

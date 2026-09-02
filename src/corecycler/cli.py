@@ -27,6 +27,7 @@ corecycler headless commands:
 
   corecycler doctor               report every external tool and where it resolved
   corecycler topology             show CCD cache evidence and X3D classification
+  corecycler policy [--config F]  preview the exact per-core tuning policy
   corecycler status               list tuner sessions and their state
   corecycler tune [--config F] [--accept-x3d-positive]
                                    start a NEW tuning session and run to the end
@@ -46,6 +47,12 @@ def cli_main(argv: list[str]) -> int:
         return cmd_doctor()
     if command == "topology":
         return cmd_topology()
+    if command == "policy":
+        config_path = _flag_value(argv[1:], "--config")
+        if config_path is _INVALID:
+            print("corecycler policy: --config requires a file path", file=sys.stderr)
+            return EXIT_REFUSED
+        return cmd_policy(config_path, "--accept-x3d-positive" in argv[1:])
     if command == "status":
         return cmd_status()
     if command == "tune":
@@ -127,6 +134,63 @@ def cmd_topology() -> int:
     from corecycler.engine.topology import detect_topology
 
     for line in topology_lines(detect_topology()):
+        print(line)
+    return EXIT_COMPLETED
+
+
+def policy_lines(snapshot, config) -> list[str]:
+    lines = [
+        f"X3D mode: {snapshot.x3d['mode']}",
+        f"Detection: {snapshot.x3d['detection']} ({snapshot.x3d['mapping_source']})",
+        "Effective V-Cache CCDs: "
+        + (",".join(map(str, snapshot.x3d["effective_vcache_ccds"])) or "none"),
+        "Positive X3D acknowledgement required: "
+        + ("yes" if config.direction > 0 and snapshot.x3d["effective_vcache_ccds"] else "no"),
+    ]
+    lines.extend(f"WARNING: {warning}" for warning in snapshot.warnings)
+    for core_class, heading in (("vcache", "V-Cache"), ("standard", "Standard/Frequency")):
+        members = [
+            f"C{core}: limit {policy.max_offset}, step {policy.coarse_step}, "
+            f"confirm {policy.confirm_multiplier:g}x"
+            for core, policy in sorted(snapshot.policies.items())
+            if policy.core_class == core_class
+        ]
+        if members:
+            lines.append(f"{heading}: " + "; ".join(members))
+    return lines
+
+
+def cmd_policy(config_path: str | None, accept_x3d_positive: bool = False) -> int:
+    from corecycler.engine.topology import detect_topology
+    from corecycler.smu.commands import detect_generation, get_commands
+    from corecycler.tuner.config import TunerConfig
+    from corecycler.tuner.policy import resolve_policy
+
+    config = TunerConfig()
+    if config_path is not None:
+        try:
+            config = TunerConfig.from_json(Path(config_path).read_text())
+        except OSError as exc:
+            print(f"corecycler: cannot read config: {exc}", file=sys.stderr)
+            return EXIT_REFUSED
+    errors = config.validate()
+    if errors:
+        print("corecycler: invalid config: " + "; ".join(errors), file=sys.stderr)
+        return EXIT_REFUSED
+    topology = detect_topology()
+    commands = get_commands(detect_generation(topology.family, topology.model, topology.model_name))
+    co_range = commands.co_range if commands is not None else (-60, 60)
+    try:
+        snapshot = resolve_policy(
+            config,
+            topology,
+            co_range,
+            positive_acknowledged=accept_x3d_positive,
+        )
+    except ValueError as exc:
+        print(f"corecycler: policy refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    for line in policy_lines(snapshot, config):
         print(line)
     return EXIT_COMPLETED
 
