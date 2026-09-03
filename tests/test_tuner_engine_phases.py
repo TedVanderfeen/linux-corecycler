@@ -783,6 +783,24 @@ class TestWorkerLaunch:
         assert scheduler.stress_config.mode is StressMode.SSE
         assert scheduler.stress_config.fft_preset is FFTPreset.SMALL
 
+    def test_per_core_tuning_uses_one_thread_on_an_smt_core(self, engine, monkeypatch):
+        physical = engine._topology.cores[0]
+        engine._topology.cores[0] = PhysicalCore(
+            core_id=physical.core_id,
+            ccd=physical.ccd,
+            ccx=physical.ccx,
+            logical_cpus=(0, 4),
+            has_vcache=physical.has_vcache,
+        )
+        worker, factory = self._real_launch(engine, monkeypatch)
+
+        engine._start_worker(0, 1)
+
+        assert worker.start.called
+        scheduler = factory.call_args.args[2]
+        assert scheduler.stress_config.threads == 1
+        assert scheduler._lane_for(0).cpus == (0,)
+
     def test_an_unbuildable_scheduler_is_an_apparatus_fault(self, engine, monkeypatch):
         worker, _factory = self._real_launch(engine, monkeypatch)
 

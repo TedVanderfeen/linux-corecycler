@@ -208,6 +208,12 @@
             packages.default = b.default;
 
             # Python lint gate — same config as pyproject [tool.ruff].
+            # Keep development-shell evaluation read-only with respect to the
+            # checkout.  A non-standard/local Nix store makes generated hook
+            # shebangs unusable from an ordinary host Git invocation, and the
+            # installer also rewrites core.hooksPath.  Checks remain available
+            # through the flake; hook installation is left to the checkout.
+            pre-commit.settings.install.enable = false;
             pre-commit.settings.hooks.ruff.enable = true;
             pre-commit.settings.hooks.taplo.excludes = [ "^pyproject\\.toml$" ];
 

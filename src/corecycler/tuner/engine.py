@@ -2461,7 +2461,11 @@ class TunerEngine(QObject):
         stress_config = StressConfig(
             mode=_stress_mode,
             fft_preset=_fft_preset,
-            threads=len(core_info.logical_cpus),
+            # Per-core CO search is intended to exercise the selected core at
+            # its highest single-thread boost point.  Loading every SMT
+            # sibling instead creates a different, lower-boost operating
+            # point and can make unstable offsets look proven.
+            threads=1,
         )
         scheduler_config = SchedulerConfig(
             seconds_per_core=duration,
